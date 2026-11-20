@@ -1,0 +1,6 @@
+{
+  "name": "AmblyoCare",
+  "description": "AI-driven adaptive visual training platform with webcam gaze interaction, calibration, visual exercises, and performance analytics for amblyopia support.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

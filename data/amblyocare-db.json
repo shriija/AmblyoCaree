@@ -1,0 +1,46 @@
+{
+  "users": [
+    {
+      "_id": "6affcdc9a675dfc97ad737c4",
+      "name": "test",
+      "email": "test@gmail.com",
+      "password": "$2b$10$b5vwR8MMRNcwtfx25rT6J.U7YF8eU2leFkbVAFzhqDnP4UH//fCm.",
+      "profileImage": "",
+      "preferences": {
+        "preferredCameraId": "",
+        "targetEye": "both",
+        "adaptiveEnabled": true,
+        "preferredDifficulty": "beginner",
+        "showGazeIndicator": true,
+        "sessionDurationSec": 45
+      },
+      "resetToken": null,
+      "resetTokenExpiry": null,
+      "createdAt": "2026-11-20T04:34:17.932Z"
+    }
+  ],
+  "calibrations": [],
+  "trainingSessions": [],
+  "userProgress": [
+    {
+      "_id": "6affcdc9a675dfc97ad737c5",
+      "userId": "6affcdc9a675dfc97ad737c4",
+      "totalSessions": 0,
+      "totalTrainingTime": 0,
+      "averageAccuracy": 0,
+      "averageReactionTime": 0,
+      "totalScore": 0,
+      "currentDifficultyLevel": "beginner",
+      "adaptiveParams": {
+        "targetSizePx": 84,
+        "targetSpeed": 1,
+        "targetDistanceRatio": 0.48,
+        "targetCount": 10,
+        "responseTimeMs": 4200,
+        "holdDurationMs": 1400
+      },
+      "lastAdjustmentNote": "Starting at Beginner baseline. Parameters adapt automatically after completed sessions.",
+      "updatedAt": "2026-11-20T04:34:17.933Z"
+    }
+  ]
+}
