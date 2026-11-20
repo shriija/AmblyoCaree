@@ -104,10 +104,18 @@ export interface ContainerGazePoint {
   confidence: number;
 }
 
+export interface NoiseFloor {
+  stdX: number;
+  stdY: number;
+  sampleCount: number;
+}
+
 export interface RollingStabilityResult {
   count: number;
   stdX: number;
   stdY: number;
+  maxStdX: number;
+  maxStdY: number;
   isStable: boolean;
 }
 
@@ -115,6 +123,8 @@ export interface CalibrationSpreadCheckResult {
   valid: boolean;
   spreadX: number;
   spreadY: number;
+  minSpreadX: number;
+  minSpreadY: number;
   reason?: string;
 }
 
@@ -501,17 +511,48 @@ export function extractEyeLandmarks(
 }
 
 /**
+ * Measures the user's baseline iris-offset noise (standard deviation) over the first ~20
+ * valid frames of calibration point 1 so stability thresholds adapt to the user's webcam & lighting.
+ */
+export function measureNoiseFloor(
+  samples: EyeLandmarkSample[],
+  eyeMode: EyeMode
+): NoiseFloor {
+  const baseline = samples.slice(0, GAZE_CONFIG.CALIBRATION_NOISE_FLOOR_FRAMES);
+  if (baseline.length < 2) {
+    return { stdX: 0, stdY: 0, sampleCount: baseline.length };
+  }
+  const xs = baseline.map((s) => getSampleFeature(s, eyeMode).x);
+  const ys = baseline.map((s) => getSampleFeature(s, eyeMode).y);
+  return {
+    stdX: standardDeviation(xs),
+    stdY: standardDeviation(ys),
+    sampleCount: baseline.length,
+  };
+}
+
+/**
  * Checks whether a rolling window of valid calibration frames has sufficient sample count
- * and low enough iris-offset standard deviation (fixation stability).
+ * and iris-offset standard deviation below max(noiseFloor * 2.5, absolute minimum).
  */
 export function computeRollingStability(
   samples: EyeLandmarkSample[],
-  eyeMode: EyeMode
+  eyeMode: EyeMode,
+  noiseFloor?: NoiseFloor | null
 ): RollingStabilityResult {
+  const maxStdX = Math.max(
+    (noiseFloor?.stdX ?? 0) * GAZE_CONFIG.CALIBRATION_NOISE_MULTIPLIER,
+    GAZE_CONFIG.CALIBRATION_MIN_ABS_STD_X
+  );
+  const maxStdY = Math.max(
+    (noiseFloor?.stdY ?? 0) * GAZE_CONFIG.CALIBRATION_NOISE_MULTIPLIER,
+    GAZE_CONFIG.CALIBRATION_MIN_ABS_STD_Y
+  );
+
   const windowSamples = samples.slice(-GAZE_CONFIG.CALIBRATION_ROLLING_WINDOW_SIZE);
   const count = windowSamples.length;
   if (count === 0) {
-    return { count: 0, stdX: Infinity, stdY: Infinity, isStable: false };
+    return { count: 0, stdX: Infinity, stdY: Infinity, maxStdX, maxStdY, isStable: false };
   }
 
   const xs = windowSamples.map((s) => getSampleFeature(s, eyeMode).x);
@@ -521,10 +562,10 @@ export function computeRollingStability(
 
   const isStable =
     count >= GAZE_CONFIG.CALIBRATION_MIN_STABLE_FRAMES &&
-    stdX <= GAZE_CONFIG.CALIBRATION_MAX_IRIS_STD_X &&
-    stdY <= GAZE_CONFIG.CALIBRATION_MAX_IRIS_STD_Y;
+    stdX <= maxStdX &&
+    stdY <= maxStdY;
 
-  return { count, stdX, stdY, isStable };
+  return { count, stdX, stdY, maxStdX, maxStdY, isStable };
 }
 
 /**
@@ -587,19 +628,69 @@ export function filterOutliersAndAverage(
 }
 
 /**
- * Verifies that the recorded 9 calibration points span a genuine eye-movement range
- * rather than staring at one spot or moving only the head.
+ * When a calibration point hits the per-point timeout with at least CALIBRATION_TIMEOUT_MIN_FRAMES
+ * valid frames, selects the lowest-variance contiguous window of frames and averages inliers so
+ * the user is not dead-ended by webcam noise.
+ */
+export function selectBestFramesAndAverage(
+  samples: EyeLandmarkSample[],
+  eyeMode: EyeMode
+): {
+  rawX: number;
+  rawY: number;
+  leftIrisX: number;
+  leftIrisY: number;
+  rightIrisX: number;
+  rightIrisY: number;
+  keptCount: number;
+  droppedCount: number;
+} {
+  const minWindow = GAZE_CONFIG.CALIBRATION_TIMEOUT_MIN_FRAMES;
+  if (samples.length <= minWindow) {
+    return filterOutliersAndAverage(samples, eyeMode);
+  }
+
+  const windowSize = Math.min(samples.length, GAZE_CONFIG.CALIBRATION_MIN_STABLE_FRAMES);
+  let bestStart = 0;
+  let bestScore = Infinity;
+
+  for (let start = 0; start <= samples.length - windowSize; start += 1) {
+    const slice = samples.slice(start, start + windowSize);
+    const xs = slice.map((s) => getSampleFeature(s, eyeMode).x);
+    const ys = slice.map((s) => getSampleFeature(s, eyeMode).y);
+    const score = standardDeviation(xs) + standardDeviation(ys);
+    if (score < bestScore) {
+      bestScore = score;
+      bestStart = start;
+    }
+  }
+
+  return filterOutliersAndAverage(samples.slice(bestStart, bestStart + windowSize), eyeMode);
+}
+
+/**
+ * Verifies that the recorded 9 calibration points span at least a low fraction (25%) of the
+ * typical iris-offset range for that eye, per axis, rather than a harsh fixed cutoff.
  */
 export function checkCalibrationSpread(
   points: CalibrationPointData[],
   eyeMode: EyeMode
 ): CalibrationSpreadCheckResult {
+  const minSpreadX = Number(
+    (GAZE_CONFIG.TYPICAL_EYE_RANGE_X[eyeMode] * GAZE_CONFIG.MIN_CALIBRATION_SPREAD_FRACTION).toFixed(4)
+  );
+  const minSpreadY = Number(
+    (GAZE_CONFIG.TYPICAL_EYE_RANGE_Y[eyeMode] * GAZE_CONFIG.MIN_CALIBRATION_SPREAD_FRACTION).toFixed(4)
+  );
+
   if (points.length < 4) {
     return {
       valid: false,
       spreadX: 0,
       spreadY: 0,
-      reason: 'Not enough calibration points were collected. Please complete all 9 dots.',
+      minSpreadX,
+      minSpreadY,
+      reason: 'Not enough calibration points were recorded: complete all 9 dots while looking directly at each target.',
     };
   }
 
@@ -609,23 +700,25 @@ export function checkCalibrationSpread(
   const spreadX = Number((Math.max(...xs) - Math.min(...xs)).toFixed(5));
   const spreadY = Number((Math.max(...ys) - Math.min(...ys)).toFixed(5));
 
-  if (
-    spreadX < GAZE_CONFIG.MIN_CALIBRATION_SPREAD_X ||
-    spreadY < GAZE_CONFIG.MIN_CALIBRATION_SPREAD_Y
-  ) {
+  if (spreadX < minSpreadX || spreadY < minSpreadY) {
+    const failedAxes = [
+      spreadX < minSpreadX ? `horizontal ${spreadX.toFixed(3)} < ${minSpreadX.toFixed(3)}` : null,
+      spreadY < minSpreadY ? `vertical ${spreadY.toFixed(3)} < ${minSpreadY.toFixed(3)}` : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
+
     return {
       valid: false,
       spreadX,
       spreadY,
-      reason: `Eye movement range across the 9 targets was too small (horizontal spread ${spreadX.toFixed(
-        3
-      )}, vertical spread ${spreadY.toFixed(
-        3
-      )}). This happens when staring at a single spot or turning your head instead of moving your eyes. Keep your head steady and look directly at each dot.`,
+      minSpreadX,
+      minSpreadY,
+      reason: `Eye movement range too small (${failedAxes}): keep your head steady and move your eyes all the way to each corner dot.`,
     };
   }
 
-  return { valid: true, spreadX, spreadY };
+  return { valid: true, spreadX, spreadY, minSpreadX, minSpreadY };
 }
 
 /**
@@ -1037,7 +1130,7 @@ export function evaluateValidationResults(
   const maxErrorPx = errors.length > 0 ? Number(Math.max(...errors).toFixed(1)) : 9999;
   const meanErrorPct = Number(((meanErrorPx / width) * 100).toFixed(2));
   const thresholdPct = GAZE_CONFIG.VALIDATION_MAX_MEAN_ERROR_PCT;
-  const passed = errors.length > 0 && meanErrorPct <= thresholdPct;
+  const passed = errors.length > 0 && meanErrorPct < thresholdPct;
 
   return {
     meanErrorPx,

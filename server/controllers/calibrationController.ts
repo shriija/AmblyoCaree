@@ -93,9 +93,24 @@ export const saveCalibration = asyncHandler(async (req: AuthenticatedRequest, re
     calibrationStatus !== 'failed'
   ) {
     throw new AppError(
-      `Validation error (${validationError.meanErrorPct.toFixed(1)}%) exceeded the ${validationError.thresholdPct}% threshold. Please recalibrate.`,
+      `Validation error (${validationError.meanErrorPct.toFixed(1)}%) exceeded the ${validationError.thresholdPct}% threshold. Please recalibrate or continue with low accuracy.`,
       400
     );
+  }
+
+  // When saving a low-confidence fallback calibration, ensure non-degenerate min/max bounds
+  const safeReferenceValues: IReferenceValues = { ...referenceValues };
+  if (lowConfidence) {
+    if (safeReferenceValues.xMax <= safeReferenceValues.xMin) {
+      const cx = Number.isFinite(safeReferenceValues.centerX) ? safeReferenceValues.centerX : 0.5;
+      safeReferenceValues.xMin = Number((cx - 0.05).toFixed(5));
+      safeReferenceValues.xMax = Number((cx + 0.05).toFixed(5));
+    }
+    if (safeReferenceValues.yMax <= safeReferenceValues.yMin) {
+      const cy = Number.isFinite(safeReferenceValues.centerY) ? safeReferenceValues.centerY : 0.5;
+      safeReferenceValues.yMin = Number((cy - 0.04).toFixed(5));
+      safeReferenceValues.yMax = Number((cy + 0.04).toFixed(5));
+    }
   }
 
   const record = await repository.saveCalibration({
@@ -104,7 +119,7 @@ export const saveCalibration = asyncHandler(async (req: AuthenticatedRequest, re
     practiceMode,
     activeTrackingMode,
     calibrationPoints: safePoints,
-    referenceValues,
+    referenceValues: safeReferenceValues,
     validationError,
     lowConfidence: Boolean(lowConfidence),
     calibrationStatus: calibrationStatus || 'completed',

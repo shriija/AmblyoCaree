@@ -4,37 +4,54 @@
  */
 
 export const GAZE_CONFIG = {
-  // Calibration fixation-gated collection (frame-count-based rolling window of last N valid frames)
+  // Calibration fixation-gated collection (adaptive noise-floor rolling window)
   CALIBRATION_SACCADE_SETTLE_MS: 400,
+  CALIBRATION_NOISE_FLOOR_FRAMES: 20, // First ~20 valid frames on point 1 establish user noise floor
+  CALIBRATION_NOISE_MULTIPLIER: 2.5, // Accept when rolling std <= max(noiseFloor * 2.5, minAbsStd)
+  CALIBRATION_MIN_ABS_STD_X: 0.035, // Absolute minimum allowed iris X std floor
+  CALIBRATION_MIN_ABS_STD_Y: 0.045, // Absolute minimum allowed iris Y std floor
   CALIBRATION_MIN_STABLE_FRAMES: 15,
-  CALIBRATION_ROLLING_WINDOW_SIZE: 15,
-  CALIBRATION_MAX_IRIS_STD_X: 0.07, // 2x previous default (0.035)
-  CALIBRATION_MAX_IRIS_STD_Y: 0.09, // 2x previous default (0.045)
+  CALIBRATION_ROLLING_WINDOW_SIZE: 20,
+  CALIBRATION_MAX_IRIS_STD_X: 0.07, // Fallback/reference upper std bound
+  CALIBRATION_MAX_IRIS_STD_Y: 0.09,
   CALIBRATION_OUTLIER_SD_MULTIPLIER: 2.0,
-  CALIBRATION_POINT_TIMEOUT_MS: 15000,
+  CALIBRATION_POINT_TIMEOUT_MS: 8000, // 8 s timeout: accept best frames if >= 10 valid, else Retry Point
+  CALIBRATION_TIMEOUT_MIN_FRAMES: 10,
   CALIBRATION_FACE_LOST_FRAMES: 6,
-  CALIBRATION_LOW_CONFIDENCE_AFTER_FAILS: 2,
+  CALIBRATION_LOW_CONFIDENCE_AFTER_FAILS: 2, // Offer "Continue anyway (low accuracy)" after 2 failed attempts
 
-  // Face framing, frontal head pose, eye-open validity, and lighting gates
-  MAX_HEAD_YAW_DEG: 27, // ~50% wider than previous 18°
-  MAX_HEAD_PITCH_DEG: 27, // ~50% wider than previous 18°
-  FACE_FRAME_MARGIN_MIN: 0.04,
-  FACE_FRAME_MARGIN_MAX: 0.96,
+  // Face framing, frontal head pose (~50% wider than 18°), eye-open validity, and lighting gates
+  MAX_HEAD_YAW_DEG: 27,
+  MAX_HEAD_PITCH_DEG: 27,
+  FACE_FRAME_MARGIN_MIN: 0.03,
+  FACE_FRAME_MARGIN_MAX: 0.97,
   MIN_EYE_OPEN_RATIO: 0.13,
   MIN_EYE_WIDTH_NORM: 0.007,
-  MIN_BRIGHTNESS_OK: 48,
-  MAX_BRIGHTNESS_OK: 218,
+  MIN_BRIGHTNESS_OK: 30,
+  MAX_BRIGHTNESS_OK: 230,
 
-  // Calibration spread check & ridge polynomial regression
+  // Calibration spread check (low 25% fraction of typical per-eye excursion, per axis) & ridge regression
+  TYPICAL_EYE_RANGE_X: {
+    left: 0.08,
+    right: 0.08,
+    both: 0.08,
+  },
+  TYPICAL_EYE_RANGE_Y: {
+    left: 0.06,
+    right: 0.06,
+    both: 0.06,
+  },
+  MIN_CALIBRATION_SPREAD_FRACTION: 0.25,
   MIN_CALIBRATION_SPREAD_X: 0.02,
   MIN_CALIBRATION_SPREAD_Y: 0.015,
   RIDGE_REGULARIZATION_LAMBDA: 0.002,
 
-  // 5-point post-fit validation step
+  // 5-point post-fit validation step (pass if < 10% screen width; otherwise warn, never block)
   VALIDATION_SETTLE_MS: 400,
   VALIDATION_SAMPLES_PER_POINT: 15,
-  VALIDATION_POINT_TIMEOUT_MS: 12000,
-  VALIDATION_MAX_MEAN_ERROR_PCT: 8, // Max allowed mean error as % of screen width
+  VALIDATION_POINT_TIMEOUT_MS: 8000,
+  VALIDATION_TIMEOUT_MIN_FRAMES: 5,
+  VALIDATION_MAX_MEAN_ERROR_PCT: 10,
 
   // Out-of-bounds & extrapolation detection during live tracking / games
   FEATURE_RANGE_MARGIN_RATIO: 0.22,

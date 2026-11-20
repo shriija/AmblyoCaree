@@ -113,8 +113,7 @@ function classifyLighting(
       contrast: roundedContrast,
       lightingStatus: 'too-dark',
       brightnessOk: false,
-      guidance:
-        'Lighting is low. Face a window or turn on a front-facing lamp for better eye landmark detection.',
+      guidance: 'Face too dark: face a light source or turn on a front-facing lamp.',
       usedOpenCv,
     };
   }
@@ -125,8 +124,7 @@ function classifyLighting(
       contrast: roundedContrast,
       lightingStatus: 'overexposed',
       brightnessOk: false,
-      guidance:
-        'Strong glare detected. Reduce bright backlighting behind you so your pupils remain clearly visible.',
+      guidance: 'Too much glare: reduce bright backlighting behind you.',
       usedOpenCv,
     };
   }

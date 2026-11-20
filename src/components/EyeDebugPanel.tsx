@@ -1,7 +1,7 @@
 import React from 'react';
 import { Eye, CheckCircle2, XCircle } from 'lucide-react';
 import { GAZE_CONFIG } from '../utils/cv/gazeConfig';
-import type { EyeLandmarkSample, PerEyeMetrics } from '../utils/cv/gazeEstimator';
+import type { EyeLandmarkSample, NoiseFloor, PerEyeMetrics } from '../utils/cv/gazeEstimator';
 import type { FrameQualityMetrics } from '../utils/cv/imageProcessing';
 import type { EyeMode } from '../types';
 
@@ -11,6 +11,7 @@ interface EyeDebugPanelProps {
   faceDetected: boolean;
   frameQuality: FrameQualityMetrics | null;
   activeGateFailure?: string | null;
+  noiseFloor?: NoiseFloor | null;
   compact?: boolean;
 }
 
@@ -127,12 +128,21 @@ export const EyeDebugPanel: React.FC<EyeDebugPanelProps> = ({
   faceDetected,
   frameQuality,
   activeGateFailure,
+  noiseFloor = null,
   compact = false,
 }) => {
   const sample = faceDetected ? eyeSample : null;
   const lightingOk = frameQuality ? frameQuality.brightnessOk : true;
   const leftActive = eyeMode === 'left' || eyeMode === 'both';
   const rightActive = eyeMode === 'right' || eyeMode === 'both';
+  const adaptiveMaxX = Math.max(
+    (noiseFloor?.stdX ?? 0) * GAZE_CONFIG.CALIBRATION_NOISE_MULTIPLIER,
+    GAZE_CONFIG.CALIBRATION_MIN_ABS_STD_X
+  );
+  const adaptiveMaxY = Math.max(
+    (noiseFloor?.stdY ?? 0) * GAZE_CONFIG.CALIBRATION_NOISE_MULTIPLIER,
+    GAZE_CONFIG.CALIBRATION_MIN_ABS_STD_Y
+  );
 
   return (
     <div className="rounded-xl border border-[#E6E3FA] bg-white p-4 space-y-3">
@@ -214,7 +224,9 @@ export const EyeDebugPanel: React.FC<EyeDebugPanelProps> = ({
         </div>
 
         <div className="rounded-lg bg-[#F7F6FF] px-2.5 py-1.5 border border-[#E6E3FA]/70">
-          <span className="block font-sans text-[10px] text-[#5C597E]">Lighting</span>
+          <span className="block font-sans text-[10px] text-[#5C597E]">
+            Lighting ({GAZE_CONFIG.MIN_BRIGHTNESS_OK}–{GAZE_CONFIG.MAX_BRIGHTNESS_OK})
+          </span>
           <strong className={lightingOk ? 'text-[#238858]' : 'text-[#C24550]'}>
             {frameQuality
               ? `${lightingOk ? 'PASS' : 'FAIL'} (${frameQuality.brightness})`
@@ -222,6 +234,18 @@ export const EyeDebugPanel: React.FC<EyeDebugPanelProps> = ({
           </strong>
         </div>
       </div>
+
+      {noiseFloor && (
+        <div className="rounded-lg bg-[#F7F6FF] px-3 py-1.5 border border-[#E6E3FA]/70 text-[11px] font-mono tabular-nums text-[#5C597E] flex flex-wrap items-center justify-between gap-2">
+          <span>
+            Noise floor ({noiseFloor.sampleCount}f): X={noiseFloor.stdX.toFixed(3)}, Y=
+            {noiseFloor.stdY.toFixed(3)}
+          </span>
+          <span>
+            Adaptive max SD: X≤{adaptiveMaxX.toFixed(3)}, Y≤{adaptiveMaxY.toFixed(3)}
+          </span>
+        </div>
+      )}
 
       {sample && (
         <div

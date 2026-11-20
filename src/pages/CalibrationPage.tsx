@@ -30,16 +30,21 @@ import {
   VALIDATION_TARGETS,
 } from '../utils/cv/gazeConfig';
 import {
+  DEFAULT_REFERENCE_VALUES,
   checkCalibrationSpread,
   computeCalibrationReferences,
   computeRollingStability,
   evaluateValidationResults,
   filterOutliersAndAverage,
   mapGazeToScreen,
+  measureNoiseFloor,
   projectGazeToContainer,
+  selectBestFramesAndAverage,
   type EyeLandmarkSample,
+  type NoiseFloor,
   type ValidationPointInput,
 } from '../utils/cv/gazeEstimator';
+import type { FrameQualityMetrics } from '../utils/cv/imageProcessing';
 import type {
   AffectedEye,
   CalibrationPointData,
@@ -53,6 +58,7 @@ type CalibrationStage =
   | 'setup'
   | 'calibrating'
   | 'validating'
+  | 'validation-warning'
   | 'saving'
   | 'complete'
   | 'rejected'
@@ -74,11 +80,16 @@ interface CalibrationLoopState {
   pointStartedAtMs: number | null;
   settleStartMs: number | null;
   samples: EyeLandmarkSample[];
+  pointAllValidSamples: EyeLandmarkSample[];
+  noiseFloor: NoiseFloor | null;
   recordedPoints: CalibrationPointData[];
   validationPredictions: Array<{ x: number; y: number }>;
+  validationAllPredictions: Array<{ x: number; y: number }>;
   validationInputs: ValidationPointInput[];
   consecutiveGateFailures: number;
   gateReason: string | null;
+  lastGateReason: string | null;
+  failedAttempts: number;
 }
 
 function formatModeLabel(mode: EyeMode): string {
@@ -87,42 +98,68 @@ function formatModeLabel(mode: EyeMode): string {
   return 'Both eyes';
 }
 
-function getGateFailureReason(frame: GazeFrameEvent, eyeMode: EyeMode): string | null {
-  if (!frame.faceDetected || !frame.sample || !frame.sample.valid) {
+/**
+ * Unified gate evaluator used by left, right, and both modes.
+ * Single-eye modes rely exclusively on the tracked eye's valid/blink flags computed in
+ * extractEyeLandmarks; the other eye is ignored completely.
+ */
+function getGateFailureReason(
+  frame: GazeFrameEvent,
+  eyeMode: EyeMode,
+  frameQuality?: FrameQualityMetrics | null
+): string | null {
+  if (!frame.faceDetected || !frame.sample) {
+    return 'Face not detected: center your face in front of the webcam.';
+  }
+
+  if (!frame.sample.valid) {
     if (eyeMode === 'left') {
-      return "We can't detect your gaze. Keep your left eye open and visible.";
+      return 'Left eye not detected: keep your left eye open and uncovered.';
     }
     if (eyeMode === 'right') {
-      return "We can't detect your gaze. Keep your right eye open and visible.";
+      return 'Right eye not detected: keep your right eye open and uncovered.';
     }
-    if (frame.faceDetected && frame.sample) {
-      if (!frame.sample.leftEye.valid && !frame.sample.rightEye.valid) {
-        return 'Both eyes need clear visibility inside the webcam view.';
-      }
-      if (!frame.sample.leftEye.valid) {
-        return 'Left eye landmarks unavailable — keep both eyes clearly visible.';
-      }
-      if (!frame.sample.rightEye.valid) {
-        return 'Right eye landmarks unavailable — keep both eyes clearly visible.';
-      }
+    if (!frame.sample.leftEye.valid && !frame.sample.rightEye.valid) {
+      return 'Both eyes not clearly visible: center your face and reduce glasses glare.';
     }
-    return 'Face lost — center your face inside the webcam view.';
+    if (!frame.sample.leftEye.valid) {
+      return 'Left eye not clearly visible: keep both eyes centered and uncovered.';
+    }
+    return 'Right eye not clearly visible: keep both eyes centered and uncovered.';
   }
-  // Single-eye blink/closed gate applies ONLY in single-eye modes, never in both-eyes mode.
-  if (frame.sample.isBlinking && eyeMode !== 'both') {
-    return `We can't detect your gaze. Keep your ${eyeMode} eye open and visible.`;
+
+  // Blink/closed check uses extractEyeLandmarks's mode-scoped isBlinking flag:
+  // tracked eye only in left/right modes, and both-eyes-closed only in both mode.
+  if (frame.sample.isBlinking) {
+    if (eyeMode === 'left') {
+      return 'Left eye appears closed: keep your left eye open and visible.';
+    }
+    if (eyeMode === 'right') {
+      return 'Right eye appears closed: keep your right eye open and visible.';
+    }
+    return 'Eyes appear closed: keep your eyes open and look steadily at the dot.';
   }
+
   if (!frame.sample.faceInFrame) {
-    return 'Face clipped by camera edge — sit slightly further back so your whole face fits in frame.';
+    return 'Face clipped by camera edge: sit slightly further back so your whole face fits in frame.';
   }
+
   if (!frame.sample.headPoseOk) {
-    return `Head turned or tilted (yaw ${Math.round(frame.sample.yawDeg)}°, pitch ${Math.round(
+    return `Head turned too far (yaw ${Math.round(frame.sample.yawDeg)}°, pitch ${Math.round(
       frame.sample.pitchDeg
-    )}°) — face straight ahead and move only your eyes.`;
+    )}°, limit ±${GAZE_CONFIG.MAX_HEAD_YAW_DEG}°): face straight ahead and move only your eyes.`;
   }
+
   if (!frame.lightingOk) {
-    return 'Lighting is outside acceptable brightness range — improve even front lighting.';
+    if (frameQuality && frameQuality.brightness < GAZE_CONFIG.MIN_BRIGHTNESS_OK) {
+      return `Face too dark (brightness ${frameQuality.brightness} < ${GAZE_CONFIG.MIN_BRIGHTNESS_OK}): face a light source or turn on a front-facing lamp.`;
+    }
+    if (frameQuality && frameQuality.brightness > GAZE_CONFIG.MAX_BRIGHTNESS_OK) {
+      return `Too much glare (brightness ${frameQuality.brightness} > ${GAZE_CONFIG.MAX_BRIGHTNESS_OK}): reduce bright backlighting behind you.`;
+    }
+    return 'Face too dark or uneven lighting: face a steady front light source.';
   }
+
   return null;
 }
 
@@ -162,9 +199,15 @@ export const CalibrationPage: React.FC = () => {
   const [pointPhase, setPointPhase] = useState<PointPhase>('idle');
   const [framesCollected, setFramesCollected] = useState(0);
   const [settleProgress, setSettleProgress] = useState(0);
-  const [stabilityReadout, setStabilityReadout] = useState<{ stdX: number; stdY: number } | null>(
-    null
-  );
+  const [stabilityReadout, setStabilityReadout] = useState<{
+    stdX: number;
+    stdY: number;
+    maxStdX: number;
+    maxStdY: number;
+  } | null>(null);
+  const [noiseFloor, setNoiseFloor] = useState<NoiseFloor | null>(null);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [savedLowConfidence, setSavedLowConfidence] = useState(false);
   const [gatePauseMessage, setGatePauseMessage] = useState<string | null>(null);
   const [recordedCount, setRecordedCount] = useState(0);
   const [computedRef, setComputedRef] = useState<ReferenceValues | null>(null);
@@ -174,6 +217,7 @@ export const CalibrationPage: React.FC = () => {
   const arenaRef = useRef<HTMLDivElement | null>(null);
   const fittedRefRef = useRef<ReferenceValues | null>(null);
   const recordedPointsRef = useRef<CalibrationPointData[]>([]);
+  const frameQualityRef = useRef<FrameQualityMetrics | null>(null);
 
   // Ref-driven loop state so the continuous webcam detection loop never tears down or goes stale
   const calRef = useRef<CalibrationLoopState>({
@@ -183,11 +227,16 @@ export const CalibrationPage: React.FC = () => {
     pointStartedAtMs: null,
     settleStartMs: null,
     samples: [],
+    pointAllValidSamples: [],
+    noiseFloor: null,
     recordedPoints: [],
     validationPredictions: [],
+    validationAllPredictions: [],
     validationInputs: [],
     consecutiveGateFailures: 0,
     gateReason: null,
+    lastGateReason: null,
+    failedAttempts: 0,
   });
 
   const selectionRef = useRef({ affectedEye, practiceMode, trackingEyeMode });
@@ -195,25 +244,13 @@ export const CalibrationPage: React.FC = () => {
     selectionRef.current = { affectedEye, practiceMode, trackingEyeMode };
   }, [affectedEye, practiceMode, trackingEyeMode]);
 
-  const finishAndSaveValidatedCalibration = useCallback(
+  const saveCalibrationRecord = useCallback(
     async (
       points: CalibrationPointData[],
       refValues: ReferenceValues,
-      validationError: ValidationError
+      validationError: ValidationError | null,
+      lowConfidence: boolean
     ) => {
-      setValidationResult(validationError);
-
-      if (!validationError.passed) {
-        calRef.current.mode = 'idle';
-        calRef.current.phase = 'idle';
-        setPointPhase('idle');
-        setStage('rejected');
-        setStatusMessage(
-          `Validation mean error was ${validationError.meanErrorPx} px (${validationError.meanErrorPct}% of screen width), which exceeds the ${validationError.thresholdPct}% accuracy threshold. Please keep your head steady, check front lighting, and recalibrate.`
-        );
-        return;
-      }
-
       setStage('saving');
       setPointPhase('finishing');
       setStatusMessage(null);
@@ -226,10 +263,13 @@ export const CalibrationPage: React.FC = () => {
           calibrationPoints: points,
           referenceValues: refValues,
           validationError,
+          lowConfidence,
           calibrationStatus: 'completed',
         });
 
         setCalibration(saved);
+        setComputedRef(refValues);
+        setSavedLowConfidence(lowConfidence);
         calRef.current.mode = 'idle';
         calRef.current.phase = 'idle';
         setPointPhase('idle');
@@ -250,25 +290,91 @@ export const CalibrationPage: React.FC = () => {
     [setCalibration]
   );
 
+  const finishAndSaveValidatedCalibration = useCallback(
+    async (
+      points: CalibrationPointData[],
+      refValues: ReferenceValues,
+      validationError: ValidationError
+    ) => {
+      setValidationResult(validationError);
+
+      // Validation < 10% passes automatically; >= 10% warns without blocking the user
+      if (!validationError.passed) {
+        calRef.current.mode = 'idle';
+        calRef.current.phase = 'idle';
+        calRef.current.failedAttempts += 1;
+        setFailedAttempts(calRef.current.failedAttempts);
+        setPointPhase('idle');
+        setStage('validation-warning');
+        setStatusMessage(
+          `Measured validation error was ${validationError.meanErrorPx} px (${validationError.meanErrorPct}% of screen width), above the ${validationError.thresholdPct}% target. You can recalibrate with steadier front lighting or continue anyway with lower accuracy.`
+        );
+        return;
+      }
+
+      await saveCalibrationRecord(points, refValues, validationError, false);
+    },
+    [saveCalibrationRecord]
+  );
+
+  const continueWithLowConfidence = useCallback(async () => {
+    const { trackingEyeMode: curTrackMode } = selectionRef.current;
+    const state = calRef.current;
+    const points =
+      recordedPointsRef.current.length > 0 ? recordedPointsRef.current : state.recordedPoints;
+
+    let refValues = fittedRefRef.current;
+    if (!refValues) {
+      if (points.length >= 4) {
+        refValues = computeCalibrationReferences(
+          points,
+          window.innerWidth,
+          window.innerHeight,
+          curTrackMode
+        );
+      } else {
+        // Fallback reference centered on any observed samples so low-accuracy bypass never fails
+        const avgSample =
+          state.pointAllValidSamples.length > 0
+            ? selectBestFramesAndAverage(state.pointAllValidSamples, curTrackMode)
+            : null;
+        const cx = avgSample
+          ? curTrackMode === 'left'
+            ? avgSample.leftIrisX
+            : curTrackMode === 'right'
+              ? avgSample.rightIrisX
+              : avgSample.rawX
+          : DEFAULT_REFERENCE_VALUES.centerX;
+        const cy = avgSample
+          ? curTrackMode === 'left'
+            ? avgSample.leftIrisY
+            : curTrackMode === 'right'
+              ? avgSample.rightIrisY
+              : avgSample.rawY
+          : DEFAULT_REFERENCE_VALUES.centerY;
+
+        refValues = {
+          ...DEFAULT_REFERENCE_VALUES,
+          xMin: Number((cx - 0.08).toFixed(5)),
+          xMax: Number((cx + 0.08).toFixed(5)),
+          yMin: Number((cy - 0.06).toFixed(5)),
+          yMax: Number((cy + 0.06).toFixed(5)),
+          centerX: Number(cx.toFixed(5)),
+          centerY: Number(cy.toFixed(5)),
+          screenWidth: window.innerWidth,
+          screenHeight: window.innerHeight,
+          calibrationQuality: 0.4,
+        };
+      }
+    }
+
+    await saveCalibrationRecord(points, refValues, validationResult, true);
+  }, [saveCalibrationRecord, validationResult]);
+
   const beginValidationPhase = useCallback((points: CalibrationPointData[]) => {
     const { trackingEyeMode: curTrackMode } = selectionRef.current;
 
-    // Step 1: Spread check — reject if user stared at one spot or only moved their head
-    const spreadCheck = checkCalibrationSpread(points, curTrackMode);
-    if (!spreadCheck.valid) {
-      calRef.current.mode = 'idle';
-      calRef.current.phase = 'idle';
-      setPointPhase('idle');
-      setValidationResult(null);
-      setStage('rejected');
-      setStatusMessage(
-        spreadCheck.reason ||
-          'Calibration rejected because iris movement range across the 9 dots was too small.'
-      );
-      return;
-    }
-
-    // Step 2: Fit 2nd-order polynomial ridge regression
+    // Fit 2nd-order polynomial ridge regression (kept ready for validation or low-accuracy bypass)
     const refValues = computeCalibrationReferences(
       points,
       window.innerWidth,
@@ -279,19 +385,40 @@ export const CalibrationPage: React.FC = () => {
     recordedPointsRef.current = points;
     setComputedRef(refValues);
 
-    // Step 3: Transition immediately to 5-point validation on unseen target positions
+    // Step 1: Per-axis spread check against 25% of typical range for this eye
+    const spreadCheck = checkCalibrationSpread(points, curTrackMode);
+    if (!spreadCheck.valid) {
+      calRef.current.mode = 'idle';
+      calRef.current.phase = 'idle';
+      calRef.current.failedAttempts += 1;
+      setFailedAttempts(calRef.current.failedAttempts);
+      setPointPhase('idle');
+      setValidationResult(null);
+      setStage('rejected');
+      setStatusMessage(
+        spreadCheck.reason ||
+          'Eye movement range across the 9 dots was too small: keep your head still and move your eyes all the way to each dot.'
+      );
+      return;
+    }
+
+    // Step 2: Transition immediately to 5-point validation on unseen target positions
     calRef.current = {
+      ...calRef.current,
       mode: 'validating',
       phase: 'settling',
       pointIndex: 0,
       pointStartedAtMs: null,
       settleStartMs: null,
       samples: [],
+      pointAllValidSamples: [],
       recordedPoints: points,
       validationPredictions: [],
+      validationAllPredictions: [],
       validationInputs: [],
       consecutiveGateFailures: 0,
       gateReason: null,
+      lastGateReason: null,
     };
 
     setPointIndex(0);
@@ -308,7 +435,12 @@ export const CalibrationPage: React.FC = () => {
   const handleFrame = useCallback(
     (frame: GazeFrameEvent) => {
       const state = calRef.current;
-      if (state.mode === 'idle' || state.phase === 'idle' || state.phase === 'finishing' || state.phase === 'timeout') {
+      if (
+        state.mode === 'idle' ||
+        state.phase === 'idle' ||
+        state.phase === 'finishing' ||
+        state.phase === 'timeout'
+      ) {
         return;
       }
 
@@ -317,25 +449,145 @@ export const CalibrationPage: React.FC = () => {
         state.pointStartedAtMs = nowMs;
       }
 
+      const curTrackMode = selectionRef.current.trackingEyeMode;
+      const arenaRect = arenaRef.current?.getBoundingClientRect() || {
+        left: 0,
+        top: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+      };
+
       const pointTimeoutMs =
         state.mode === 'validating'
           ? GAZE_CONFIG.VALIDATION_POINT_TIMEOUT_MS
           : GAZE_CONFIG.CALIBRATION_POINT_TIMEOUT_MS;
 
-      // Never auto-skip: if a point exceeds its timeout, pause and offer Retry
+      // 8 s per-point timeout: accept best frames if >= min frames collected, else Retry Point only
       if (nowMs - state.pointStartedAtMs >= pointTimeoutMs) {
+        if (
+          state.mode === 'calibrating' &&
+          state.pointAllValidSamples.length >= GAZE_CONFIG.CALIBRATION_TIMEOUT_MIN_FRAMES
+        ) {
+          if (state.pointIndex === 0 && !state.noiseFloor) {
+            const nf = measureNoiseFloor(state.pointAllValidSamples, curTrackMode);
+            state.noiseFloor = nf;
+            setNoiseFloor(nf);
+          }
+
+          const best = selectBestFramesAndAverage(state.pointAllValidSamples, curTrackMode);
+          const target = CALIBRATION_TARGETS[state.pointIndex];
+          const targetViewportX = arenaRect.left + target.xNorm * arenaRect.width;
+          const targetViewportY = arenaRect.top + target.yNorm * arenaRect.height;
+          const screenXNorm = Number((targetViewportX / Math.max(1, window.innerWidth)).toFixed(5));
+          const screenYNorm = Number((targetViewportY / Math.max(1, window.innerHeight)).toFixed(5));
+
+          const pointRecord: CalibrationPointData = {
+            id: target.id,
+            label: target.label,
+            screenXNorm,
+            screenYNorm,
+            rawX: best.rawX,
+            rawY: best.rawY,
+            leftIrisX: best.leftIrisX,
+            leftIrisY: best.leftIrisY,
+            rightIrisX: best.rightIrisX,
+            rightIrisY: best.rightIrisY,
+            samplesCollected: best.keptCount,
+          };
+
+          state.recordedPoints = [...state.recordedPoints, pointRecord];
+          state.samples = [];
+          state.pointAllValidSamples = [];
+          state.lastGateReason = null;
+          setRecordedCount(state.recordedPoints.length);
+          setFramesCollected(0);
+          setStabilityReadout(null);
+          setGatePauseMessage(null);
+
+          if (state.pointIndex + 1 < CALIBRATION_TARGETS.length) {
+            state.pointIndex += 1;
+            state.phase = 'settling';
+            state.pointStartedAtMs = nowMs;
+            state.settleStartMs = nowMs;
+            setPointIndex(state.pointIndex);
+            setPointPhase('settling');
+            setSettleProgress(0);
+          } else {
+            state.phase = 'finishing';
+            beginValidationPhase(state.recordedPoints);
+          }
+          return;
+        }
+
+        if (
+          state.mode === 'validating' &&
+          fittedRefRef.current &&
+          state.validationAllPredictions.length >= GAZE_CONFIG.VALIDATION_TIMEOUT_MIN_FRAMES
+        ) {
+          const preds = state.validationAllPredictions;
+          const valTarget = VALIDATION_TARGETS[state.pointIndex];
+          const avgPredX = preds.reduce((sum, p) => sum + p.x, 0) / preds.length;
+          const avgPredY = preds.reduce((sum, p) => sum + p.y, 0) / preds.length;
+
+          state.validationInputs.push({
+            id: valTarget.id,
+            label: valTarget.label,
+            targetX: valTarget.xNorm * arenaRect.width,
+            targetY: valTarget.yNorm * arenaRect.height,
+            predictedX: avgPredX,
+            predictedY: avgPredY,
+          });
+          state.validationPredictions = [];
+          state.validationAllPredictions = [];
+          state.lastGateReason = null;
+          setFramesCollected(0);
+          setGatePauseMessage(null);
+
+          if (state.pointIndex + 1 < VALIDATION_TARGETS.length) {
+            state.pointIndex += 1;
+            state.phase = 'settling';
+            state.pointStartedAtMs = nowMs;
+            state.settleStartMs = nowMs;
+            setPointIndex(state.pointIndex);
+            setPointPhase('settling');
+            setSettleProgress(0);
+          } else {
+            state.phase = 'finishing';
+            const evalResult = evaluateValidationResults(
+              state.validationInputs,
+              arenaRect.width
+            );
+            void finishAndSaveValidatedCalibration(
+              recordedPointsRef.current,
+              fittedRefRef.current,
+              evalResult
+            );
+          }
+          return;
+        }
+
+        // Fewer than minimum valid frames collected in 8 s -> pause THIS point only
         state.phase = 'timeout';
+        state.failedAttempts += 1;
+        setFailedAttempts(state.failedAttempts);
         setPointPhase('timeout');
+        const reasonDetail = state.lastGateReason
+          ? ` Last issue: ${state.lastGateReason}`
+          : ' Try holding your head steady and facing a light source.';
         setGatePauseMessage(
-          `Point timed out after ${Math.round(pointTimeoutMs / 1000)} seconds before a steady fixation was recorded. Click Retry Point to try again.`
+          `Only ${
+            state.mode === 'validating'
+              ? state.validationAllPredictions.length
+              : state.pointAllValidSamples.length
+          } valid frames captured in ${Math.round(pointTimeoutMs / 1000)}s.${reasonDetail}`
         );
         return;
       }
 
-      // Check all strict collection gates simultaneously:
-      // face detected, valid tracked-eye sample, head frontal, face inside frame, brightness OK
-      const gateFailure = getGateFailureReason(frame, selectionRef.current.trackingEyeMode);
+      // Check all active collection gates uniformly across left, right, and both modes
+      const gateFailure = getGateFailureReason(frame, curTrackMode, frameQualityRef.current);
       if (gateFailure) {
+        state.lastGateReason = gateFailure;
         state.consecutiveGateFailures += 1;
         if (
           state.consecutiveGateFailures >= GAZE_CONFIG.CALIBRATION_FACE_LOST_FRAMES ||
@@ -345,7 +597,7 @@ export const CalibrationPage: React.FC = () => {
             state.phase = 'paused-gate';
             state.gateReason = gateFailure;
             state.settleStartMs = null;
-            // Clear unstable partial rolling buffer so looked-away frames are never mixed in
+            // Clear rolling stability window so looked-away frames are never mixed in
             state.samples = [];
             state.validationPredictions = [];
             setPointPhase('paused-gate');
@@ -398,30 +650,41 @@ export const CalibrationPage: React.FC = () => {
         return;
       }
 
-      const arenaRect = arenaRef.current?.getBoundingClientRect() || {
-        left: 0,
-        top: 0,
-        width: window.innerWidth,
-        height: window.innerHeight,
-      };
-      const curTrackMode = selectionRef.current.trackingEyeMode;
-
       // ─────────────────────────────────────────────────────────────────
-      // MODE A: 9-POINT FIXATION-GATED CALIBRATION
+      // MODE A: 9-POINT ADAPTIVE FIXATION-GATED CALIBRATION
       // ─────────────────────────────────────────────────────────────────
       if (state.mode === 'calibrating') {
         state.samples.push(sample);
+        state.pointAllValidSamples.push(sample);
         if (state.samples.length > GAZE_CONFIG.CALIBRATION_ROLLING_WINDOW_SIZE) {
           state.samples.shift();
         }
 
-        const stability = computeRollingStability(state.samples, curTrackMode);
+        // Point 1: measure user's baseline iris noise floor over the first ~20 valid frames
+        if (state.pointIndex === 0 && !state.noiseFloor) {
+          const nfFrames = state.pointAllValidSamples.length;
+          setFramesCollected(Math.min(nfFrames, GAZE_CONFIG.CALIBRATION_NOISE_FLOOR_FRAMES));
+          if (nfFrames < GAZE_CONFIG.CALIBRATION_NOISE_FLOOR_FRAMES) {
+            if (state.phase !== 'collecting') {
+              state.phase = 'collecting';
+              setPointPhase('collecting');
+            }
+            return;
+          }
+          const measured = measureNoiseFloor(state.pointAllValidSamples, curTrackMode);
+          state.noiseFloor = measured;
+          setNoiseFloor(measured);
+        }
+
+        const stability = computeRollingStability(state.samples, curTrackMode, state.noiseFloor);
         setFramesCollected(Math.min(stability.count, GAZE_CONFIG.CALIBRATION_MIN_STABLE_FRAMES));
 
         if (stability.count >= GAZE_CONFIG.CALIBRATION_MIN_STABLE_FRAMES) {
           setStabilityReadout({
             stdX: Number(stability.stdX.toFixed(4)),
             stdY: Number(stability.stdY.toFixed(4)),
+            maxStdX: Number(stability.maxStdX.toFixed(4)),
+            maxStdY: Number(stability.maxStdY.toFixed(4)),
           });
 
           if (!stability.isStable) {
@@ -458,6 +721,8 @@ export const CalibrationPage: React.FC = () => {
 
           state.recordedPoints = [...state.recordedPoints, pointRecord];
           state.samples = [];
+          state.pointAllValidSamples = [];
+          state.lastGateReason = null;
           setRecordedCount(state.recordedPoints.length);
           setFramesCollected(0);
           setStabilityReadout(null);
@@ -495,10 +760,12 @@ export const CalibrationPage: React.FC = () => {
         );
         const projected = projectGazeToContainer(mapped, arenaRect);
 
-        state.validationPredictions.push({
+        const pred = {
           x: projected.containerX,
           y: projected.containerY,
-        });
+        };
+        state.validationPredictions.push(pred);
+        state.validationAllPredictions.push(pred);
 
         const count = state.validationPredictions.length;
         setFramesCollected(count);
@@ -519,6 +786,8 @@ export const CalibrationPage: React.FC = () => {
             predictedY: avgPredY,
           });
           state.validationPredictions = [];
+          state.validationAllPredictions = [];
+          state.lastGateReason = null;
           setFramesCollected(0);
 
           if (state.pointIndex + 1 < VALIDATION_TARGETS.length) {
@@ -566,6 +835,8 @@ export const CalibrationPage: React.FC = () => {
     onFrame: handleFrame,
   });
 
+  frameQualityRef.current = frameQuality;
+
   const handleSelectionChange = async (
     nextAffectedEye: AffectedEye,
     nextPracticeMode: PracticeMode
@@ -578,8 +849,17 @@ export const CalibrationPage: React.FC = () => {
     setModeNotice(null);
     setValidationResult(null);
     setComputedRef(null);
+    setNoiseFloor(null);
+    setSavedLowConfidence(false);
+    calRef.current.failedAttempts = 0;
+    setFailedAttempts(0);
 
-    if (stage === 'complete' || stage === 'failed' || stage === 'rejected') {
+    if (
+      stage === 'complete' ||
+      stage === 'failed' ||
+      stage === 'rejected' ||
+      stage === 'validation-warning'
+    ) {
       setStage('setup');
     }
 
@@ -593,7 +873,7 @@ export const CalibrationPage: React.FC = () => {
         );
       } else {
         setModeNotice(
-          `Loaded your existing validated calibration mapping for ${formatModeLabel(nextTrack)}. You can train now, re-run validation, or recalibrate anytime.`
+          `Loaded your existing calibration mapping for ${formatModeLabel(nextTrack)}. You can train now, re-run validation, or recalibrate anytime.`
         );
       }
     } catch (err) {
@@ -608,22 +888,29 @@ export const CalibrationPage: React.FC = () => {
     setModeNotice(null);
     setGatePauseMessage(null);
     setStabilityReadout(null);
+    setNoiseFloor(null);
     setValidationResult(null);
+    setSavedLowConfidence(false);
     fittedRefRef.current = null;
     recordedPointsRef.current = [];
 
     calRef.current = {
+      ...calRef.current,
       mode: 'calibrating',
       phase: 'settling',
       pointIndex: 0,
       pointStartedAtMs: null,
       settleStartMs: null,
       samples: [],
+      pointAllValidSamples: [],
+      noiseFloor: null,
       recordedPoints: [],
       validationPredictions: [],
+      validationAllPredictions: [],
       validationInputs: [],
       consecutiveGateFailures: 0,
       gateReason: null,
+      lastGateReason: null,
     };
 
     setPointIndex(0);
@@ -642,6 +929,7 @@ export const CalibrationPage: React.FC = () => {
     setGatePauseMessage(null);
     setStabilityReadout(null);
     setValidationResult(null);
+    setSavedLowConfidence(false);
 
     fittedRefRef.current = activeModeMapping.referenceValues;
     recordedPointsRef.current = activeModeMapping.calibrationPoints;
@@ -649,17 +937,21 @@ export const CalibrationPage: React.FC = () => {
     setRecordedCount(activeModeMapping.calibrationPoints.length);
 
     calRef.current = {
+      ...calRef.current,
       mode: 'validating',
       phase: 'settling',
       pointIndex: 0,
       pointStartedAtMs: null,
       settleStartMs: null,
       samples: [],
+      pointAllValidSamples: [],
       recordedPoints: activeModeMapping.calibrationPoints,
       validationPredictions: [],
+      validationAllPredictions: [],
       validationInputs: [],
       consecutiveGateFailures: 0,
       gateReason: null,
+      lastGateReason: null,
     };
 
     setPointIndex(0);
@@ -675,9 +967,12 @@ export const CalibrationPage: React.FC = () => {
     state.pointStartedAtMs = performance.now();
     state.settleStartMs = performance.now();
     state.samples = [];
+    state.pointAllValidSamples = [];
     state.validationPredictions = [];
+    state.validationAllPredictions = [];
     state.consecutiveGateFailures = 0;
     state.gateReason = null;
+    state.lastGateReason = null;
 
     setPointPhase('settling');
     setGatePauseMessage(null);
@@ -690,8 +985,10 @@ export const CalibrationPage: React.FC = () => {
     calRef.current.mode = 'idle';
     calRef.current.phase = 'idle';
     calRef.current.samples = [];
+    calRef.current.pointAllValidSamples = [];
     calRef.current.recordedPoints = [];
     calRef.current.validationPredictions = [];
+    calRef.current.validationAllPredictions = [];
     calRef.current.validationInputs = [];
     setPointPhase('idle');
     setGatePauseMessage(null);
@@ -707,10 +1004,16 @@ export const CalibrationPage: React.FC = () => {
   const requiredSamples =
     stage === 'validating'
       ? GAZE_CONFIG.VALIDATION_SAMPLES_PER_POINT
-      : GAZE_CONFIG.CALIBRATION_MIN_STABLE_FRAMES;
+      : pointIndex === 0 && !noiseFloor
+        ? GAZE_CONFIG.CALIBRATION_NOISE_FLOOR_FRAMES
+        : GAZE_CONFIG.CALIBRATION_MIN_STABLE_FRAMES;
   const frameProgressPct = Math.min(100, Math.round((framesCollected / requiredSamples) * 100));
   const isSingleEyeMode = practiceMode === 'affected-eye-only' && affectedEye !== 'not-sure';
   const otherEyeName = affectedEye === 'left' ? 'right' : 'left';
+  const canContinueLowConfidence =
+    failedAttempts >= GAZE_CONFIG.CALIBRATION_LOW_CONFIDENCE_AFTER_FAILS ||
+    stage === 'validating' ||
+    stage === 'validation-warning';
   // Strictly read validation error for the active mode (never leak another mode's validation)
   const savedValidation = validationResult || activeModeMapping?.validationError || null;
   const liveGateFailure =
@@ -724,7 +1027,8 @@ export const CalibrationPage: React.FC = () => {
             gazeStatus: faceDetected && eyeSample?.valid ? 'ok' : 'face-lost',
             timestamp: 0,
           },
-          trackingEyeMode
+          trackingEyeMode,
+          frameQuality
         )
       : null;
 
@@ -861,22 +1165,24 @@ export const CalibrationPage: React.FC = () => {
               </div>
 
               {pointPhase === 'timeout' && (
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
                   <button
                     type="button"
                     onClick={retryCurrentPoint}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-[#6554E8] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#5342D6]"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
-                    Retry Point
+                    Retry Point {pointIndex + 1}
                   </button>
-                  <button
-                    type="button"
-                    onClick={beginCalibrationSequence}
-                    className="rounded-lg border border-[#E6E3FA] bg-white px-3 py-1.5 text-xs font-semibold text-[#25234A] hover:bg-[#F7F6FF]"
-                  >
-                    Restart All
-                  </button>
+                  {canContinueLowConfidence && (
+                    <button
+                      type="button"
+                      onClick={() => void continueWithLowConfidence()}
+                      className="rounded-lg border border-[#D98E16]/50 bg-white px-3 py-1.5 text-xs font-semibold text-[#7D550E] hover:bg-[#FFF3D6]"
+                    >
+                      Continue anyway (low accuracy)
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -901,38 +1207,51 @@ export const CalibrationPage: React.FC = () => {
                           ? `Look directly at "${currentTarget.label}"`
                           : stage === 'validating'
                             ? `Validating accuracy on "${currentTarget.label}"`
-                            : `Hold steady on "${currentTarget.label}"`}
+                            : pointIndex === 0 && !noiseFloor
+                              ? `Measuring your camera baseline on "${currentTarget.label}"`
+                              : `Hold steady on "${currentTarget.label}"`}
                 </p>
                 <p className="mt-1 text-xs text-[#5C597E]">
                   {pointPhase === 'timeout'
-                    ? 'Steady fixation was not reached within the time limit. Retry this point without losing earlier points.'
+                    ? gatePauseMessage ||
+                      'Not enough valid frames were captured. Retry just this point without losing earlier points.'
                     : pointPhase === 'paused-gate'
-                      ? 'Keep your face centered, level, and evenly lit. This point will not be skipped.'
+                      ? gatePauseMessage ||
+                        'Keep your face centered, level, and evenly lit. This point will not be skipped.'
                       : pointPhase === 'unstable'
-                        ? 'Iris signal is moving too much to lock fixation. Keep your head still and fixate on the dot center.'
+                        ? 'Iris signal is slightly noisy — keep your head still and fixate on the dot center.'
                         : pointPhase === 'settling'
                           ? 'Ignoring initial eye movement (~0.4s) before sampling...'
-                          : `Collecting ${framesCollected} of ${requiredSamples} valid frames — advances when fixation is steady.`}
+                          : `Collecting ${framesCollected} of ${requiredSamples} valid frames — advances automatically.`}
                 </p>
 
                 {stabilityReadout && stage === 'calibrating' && (
                   <p className="mt-1.5 font-mono text-[11px] text-[#5C597E] tabular-nums">
-                    Iris SD X: {stabilityReadout.stdX.toFixed(3)} (max{' '}
-                    {GAZE_CONFIG.CALIBRATION_MAX_IRIS_STD_X}) · Y:{' '}
-                    {stabilityReadout.stdY.toFixed(3)} (max {GAZE_CONFIG.CALIBRATION_MAX_IRIS_STD_Y})
+                    Iris SD X: {stabilityReadout.stdX.toFixed(3)} /{' '}
+                    {stabilityReadout.maxStdX.toFixed(3)} · Y: {stabilityReadout.stdY.toFixed(3)} /{' '}
+                    {stabilityReadout.maxStdY.toFixed(3)}
                   </p>
                 )}
 
                 {pointPhase === 'timeout' ? (
-                  <div className="mt-3 flex items-center justify-center gap-2">
+                  <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
                     <button
                       type="button"
                       onClick={retryCurrentPoint}
                       className="inline-flex items-center gap-1.5 rounded-lg bg-[#6554E8] px-4 py-2 text-xs font-semibold text-white hover:bg-[#5342D6]"
                     >
                       <RotateCcw className="w-3.5 h-3.5" />
-                      Retry Point
+                      Retry Point {pointIndex + 1}
                     </button>
+                    {canContinueLowConfidence && (
+                      <button
+                        type="button"
+                        onClick={() => void continueWithLowConfidence()}
+                        className="rounded-lg border border-[#E6E3FA] bg-white px-3.5 py-2 text-xs font-semibold text-[#25234A] hover:bg-[#F7F6FF]"
+                      >
+                        Continue anyway (low accuracy)
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <div className="mt-3 h-2 w-full rounded-full bg-[#E6E3FA] overflow-hidden">
@@ -1079,6 +1398,7 @@ export const CalibrationPage: React.FC = () => {
               faceDetected={faceDetected}
               frameQuality={frameQuality}
               activeGateFailure={liveGateFailure}
+              noiseFloor={noiseFloor}
               compact={isArenaOpen}
             />
           )}
@@ -1108,6 +1428,65 @@ export const CalibrationPage: React.FC = () => {
             </div>
           )}
 
+          {stage === 'validation-warning' && validationResult && (
+            <div className="rounded-2xl border border-[#F2B84B]/60 bg-white p-6">
+              <div className="flex items-start gap-3">
+                <AlertCircle className="w-5 h-5 text-[#D98E16] shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <h3 className="font-display text-base font-bold text-[#25234A]">
+                    Validation error above {validationResult.thresholdPct}% target (low accuracy)
+                  </h3>
+                  <p className="mt-1 text-sm text-[#5C597E] leading-relaxed">{statusMessage}</p>
+
+                  <div className="mt-3 grid grid-cols-3 gap-2.5 rounded-xl bg-[#FFF9EB] border border-[#F2B84B]/35 p-3 text-xs font-mono tabular-nums">
+                    <div>
+                      <span className="block font-sans text-[11px] text-[#5C597E]">
+                        Mean Error
+                      </span>
+                      <strong className="text-[#9E6A0F]">{validationResult.meanErrorPx} px</strong>
+                    </div>
+                    <div>
+                      <span className="block font-sans text-[11px] text-[#5C597E]">
+                        % of Width
+                      </span>
+                      <strong className="text-[#9E6A0F]">
+                        {validationResult.meanErrorPct}%
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="block font-sans text-[11px] text-[#5C597E]">
+                        Target
+                      </span>
+                      <strong className="text-[#25234A]">
+                        &lt; {validationResult.thresholdPct}%
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 flex flex-wrap items-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => void continueWithLowConfidence()}
+                      className="inline-flex items-center gap-2 rounded-lg bg-[#6554E8] px-4 py-2 text-xs font-semibold text-white hover:bg-[#5342D6]"
+                    >
+                      Continue anyway (low accuracy)
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={beginCalibrationSequence}
+                      disabled={cameraStatus !== 'ready'}
+                      className="inline-flex items-center gap-2 rounded-lg border border-[#E6E3FA] bg-white px-4 py-2 text-xs font-semibold text-[#25234A] hover:bg-[#F7F6FF] disabled:opacity-50"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      Recalibrate
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {(stage === 'rejected' || stage === 'failed') && (
             <div className="rounded-2xl border border-[#E76B75]/45 bg-white p-6">
               <div className="flex items-start gap-3">
@@ -1115,78 +1494,86 @@ export const CalibrationPage: React.FC = () => {
                 <div className="flex-1">
                   <h3 className="font-display text-base font-bold text-[#25234A]">
                     {stage === 'rejected'
-                      ? 'Calibration did not pass quality validation'
+                      ? 'Calibration spread check needs another pass'
                       : 'Calibration could not be saved'}
                   </h3>
                   <p className="mt-1 text-sm text-[#5C597E] leading-relaxed">{statusMessage}</p>
 
-                  {validationResult && (
-                    <div className="mt-3 grid grid-cols-3 gap-2.5 rounded-xl bg-[#FFF5F6] border border-[#E76B75]/25 p-3 text-xs font-mono tabular-nums">
-                      <div>
-                        <span className="block font-sans text-[11px] text-[#5C597E]">
-                          Mean Error
-                        </span>
-                        <strong className="text-[#C24550]">{validationResult.meanErrorPx} px</strong>
-                      </div>
-                      <div>
-                        <span className="block font-sans text-[11px] text-[#5C597E]">
-                          % of Width
-                        </span>
-                        <strong className="text-[#C24550]">
-                          {validationResult.meanErrorPct}%
-                        </strong>
-                      </div>
-                      <div>
-                        <span className="block font-sans text-[11px] text-[#5C597E]">
-                          Required Max
-                        </span>
-                        <strong className="text-[#25234A]">
-                          ≤ {validationResult.thresholdPct}%
-                        </strong>
-                      </div>
-                    </div>
-                  )}
-
-                  <button
-                    type="button"
-                    onClick={beginCalibrationSequence}
-                    disabled={cameraStatus !== 'ready'}
-                    className="mt-4 inline-flex items-center gap-2 rounded-lg bg-[#6554E8] px-4 py-2 text-xs font-semibold text-white hover:bg-[#5342D6] disabled:opacity-50"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    Recalibrate
-                  </button>
+                  <div className="mt-4 flex flex-wrap items-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={beginCalibrationSequence}
+                      disabled={cameraStatus !== 'ready'}
+                      className="inline-flex items-center gap-2 rounded-lg bg-[#6554E8] px-4 py-2 text-xs font-semibold text-white hover:bg-[#5342D6] disabled:opacity-50"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      Recalibrate
+                    </button>
+                    {failedAttempts >= GAZE_CONFIG.CALIBRATION_LOW_CONFIDENCE_AFTER_FAILS && (
+                      <button
+                        type="button"
+                        onClick={() => void continueWithLowConfidence()}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-[#F2B84B]/60 bg-[#FFF9EB] px-4 py-2 text-xs font-semibold text-[#7D550E] hover:bg-[#FFF1CC]"
+                      >
+                        Continue anyway (low accuracy)
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
           )}
 
           {stage === 'complete' && (computedRef || activeModeReference) && (
-            <div className="rounded-2xl border border-[#35B779]/40 bg-white p-6">
+            <div
+              className={`rounded-2xl border bg-white p-6 ${
+                savedLowConfidence ? 'border-[#F2B84B]/60' : 'border-[#35B779]/40'
+              }`}
+            >
               <div className="flex items-start gap-3">
-                <CheckCircle2 className="w-5 h-5 text-[#35B779] shrink-0 mt-0.5" />
+                {savedLowConfidence ? (
+                  <AlertCircle className="w-5 h-5 text-[#D98E16] shrink-0 mt-0.5" />
+                ) : (
+                  <CheckCircle2 className="w-5 h-5 text-[#35B779] shrink-0 mt-0.5" />
+                )}
                 <div className="flex-1">
                   <h3 className="font-display text-base font-bold text-[#25234A]">
-                    Calibration validated & saved for {formatModeLabel(trackingEyeMode)}
+                    {savedLowConfidence
+                      ? `Calibration saved (low accuracy) for ${formatModeLabel(trackingEyeMode)}`
+                      : `Calibration validated & saved for ${formatModeLabel(trackingEyeMode)}`}
                   </h3>
                   <p className="mt-1 text-xs text-[#5C597E]">
-                    9 fixation-gated calibration points were fitted with ridge regression and
-                    verified across 5 unseen validation targets.
+                    {savedLowConfidence
+                      ? 'Saved with lowConfidence enabled so you can continue training right away. You can recalibrate anytime in better front lighting for tighter accuracy.'
+                      : '9 adaptive fixation-gated calibration points were fitted with ridge regression and verified across 5 unseen validation targets.'}
                   </p>
 
                   {savedValidation && (
-                    <div className="mt-3.5 grid grid-cols-3 gap-3 rounded-xl bg-[#F3FBF7] border border-[#35B779]/25 p-3.5 text-xs font-mono tabular-nums">
+                    <div
+                      className={`mt-3.5 grid grid-cols-3 gap-3 rounded-xl border p-3.5 text-xs font-mono tabular-nums ${
+                        savedValidation.passed
+                          ? 'bg-[#F3FBF7] border-[#35B779]/25'
+                          : 'bg-[#FFF9EB] border-[#F2B84B]/35'
+                      }`}
+                    >
                       <div>
                         <span className="block text-[11px] font-sans text-[#5C597E]">
                           Validation Mean Error
                         </span>
-                        <strong className="text-[#238858]">{savedValidation.meanErrorPx} px</strong>
+                        <strong
+                          className={savedValidation.passed ? 'text-[#238858]' : 'text-[#9E6A0F]'}
+                        >
+                          {savedValidation.meanErrorPx} px
+                        </strong>
                       </div>
                       <div>
                         <span className="block text-[11px] font-sans text-[#5C597E]">
                           % of Width
                         </span>
-                        <strong className="text-[#238858]">
+                        <strong
+                          className={savedValidation.passed ? 'text-[#238858]' : 'text-[#9E6A0F]'}
+                        >
                           {savedValidation.meanErrorPct}%
                         </strong>
                       </div>
@@ -1195,7 +1582,7 @@ export const CalibrationPage: React.FC = () => {
                           Pass Threshold
                         </span>
                         <strong className="text-[#25234A]">
-                          ≤ {savedValidation.thresholdPct}%
+                          &lt; {savedValidation.thresholdPct}%
                         </strong>
                       </div>
                     </div>
@@ -1397,16 +1784,26 @@ export const CalibrationPage: React.FC = () => {
                       <p className="font-semibold text-[#25234A]">{formatModeLabel(modeKey)}</p>
                       <p
                         className={`mt-0.5 text-[11px] tabular-nums ${
-                          savedMapping ? 'text-[#238858] font-medium' : 'text-[#5C597E]'
+                          savedMapping
+                            ? savedMapping.lowConfidence
+                              ? 'text-[#A87518] font-medium'
+                              : 'text-[#238858] font-medium'
+                            : 'text-[#5C597E]'
                         }`}
                       >
                         {savedMapping
-                          ? valErr
-                            ? `Validated · ${valErr.meanErrorPct}% err`
-                            : `Calibrated · ${new Date(savedMapping.calibratedAt).toLocaleDateString(
-                                'en-US',
-                                { month: 'short', day: 'numeric' }
-                              )}`
+                          ? savedMapping.lowConfidence
+                            ? valErr
+                              ? `Low accuracy · ${valErr.meanErrorPct}% err`
+                              : 'Saved (low accuracy)'
+                            : valErr
+                              ? `Validated · ${valErr.meanErrorPct}% err`
+                              : `Calibrated · ${new Date(
+                                  savedMapping.calibratedAt
+                                ).toLocaleDateString('en-US', {
+                                  month: 'short',
+                                  day: 'numeric',
+                                })}`
                           : isCurrent
                             ? 'Calibration required'
                             : 'Not calibrated'}
@@ -1421,34 +1818,36 @@ export const CalibrationPage: React.FC = () => {
           {/* Step 2: Launch 9-Point Fixation-Gated Calibration + 5-Point Validation */}
           <section className="rounded-2xl border border-[#E6E3FA] bg-white p-6">
             <p className="text-xs font-semibold text-[#6554E8]">
-              Step 2 · Fixation-Gated Calibration & Accuracy Check
+              Step 2 · Adaptive Calibration & Accuracy Check
             </p>
             <h3 className="mt-0.5 font-display text-base font-bold text-[#25234A]">
-              How calibration validity is enforced
+              How calibration adapts to your camera
             </h3>
             <ol className="mt-3.5 space-y-2.5 text-sm text-[#5C597E]">
               <li className="flex gap-3">
                 <span className="font-mono text-xs font-semibold text-[#6554E8] mt-0.5">01</span>
                 <span>
-                  Frames are accepted only while your face is fully in view, frontal (head yaw/pitch
-                  within ±{GAZE_CONFIG.MAX_HEAD_YAW_DEG}°), and evenly lit.
+                  Point 1 measures your camera&apos;s baseline iris noise over the first{' '}
+                  {GAZE_CONFIG.CALIBRATION_NOISE_FLOOR_FRAMES} valid frames so stability adapts to
+                  your webcam and lighting (head pose limit ±{GAZE_CONFIG.MAX_HEAD_YAW_DEG}°).
                 </span>
               </li>
               <li className="flex gap-3">
                 <span className="font-mono text-xs font-semibold text-[#6554E8] mt-0.5">02</span>
                 <span>
-                  Each of the 9 dots discards the first {GAZE_CONFIG.CALIBRATION_SACCADE_SETTLE_MS}
-                  ms of eye travel, requires at least {GAZE_CONFIG.CALIBRATION_MIN_STABLE_FRAMES}{' '}
-                  steady frames in a rolling window, and rejects outliers beyond 2 SD before
-                  averaging.
+                  Each of the 9 dots discards {GAZE_CONFIG.CALIBRATION_SACCADE_SETTLE_MS}ms of eye
+                  travel, drops outliers beyond 2 SD, and automatically accepts the steadiest frames
+                  if {GAZE_CONFIG.CALIBRATION_TIMEOUT_MIN_FRAMES}+ valid frames are captured within{' '}
+                  {Math.round(GAZE_CONFIG.CALIBRATION_POINT_TIMEOUT_MS / 1000)}s.
                 </span>
               </li>
               <li className="flex gap-3">
                 <span className="font-mono text-xs font-semibold text-[#6554E8] mt-0.5">03</span>
                 <span>
-                  After checking genuine eye-movement spread and fitting a ridge polynomial model, 5
-                  unseen validation points verify mean error is ≤{' '}
-                  {GAZE_CONFIG.VALIDATION_MAX_MEAN_ERROR_PCT}% of width before saving.
+                  After checking eye-movement spread and fitting the ridge polynomial model, 5
+                  unseen validation points pass automatically under{' '}
+                  {GAZE_CONFIG.VALIDATION_MAX_MEAN_ERROR_PCT}% error—or warn while letting you
+                  continue or recalibrate.
                 </span>
               </li>
             </ol>
@@ -1462,6 +1861,14 @@ export const CalibrationPage: React.FC = () => {
                   {activeModeMapping?.validationError?.passed ? (
                     <span className="text-[#238858] font-medium">
                       Validated ({activeModeMapping.validationError.meanErrorPct}% err)
+                    </span>
+                  ) : activeModeMapping?.lowConfidence ? (
+                    <span className="text-[#A87518] font-medium">
+                      Saved (low accuracy
+                      {activeModeMapping.validationError
+                        ? `, ${activeModeMapping.validationError.meanErrorPct}% err`
+                        : ''}
+                      )
                     </span>
                   ) : activeModeMapping ? (
                     <span className="text-[#A87518] font-medium">Validation required</span>
